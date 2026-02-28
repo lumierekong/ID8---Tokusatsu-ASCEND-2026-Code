@@ -1,0 +1,177 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SD.h>
+#include <SPI.h>
+#include <MPU6050.h>
+#include <LoRa.h>
+#include <LZ4.h>
+#include "esp_sleep.h"
+
+#define TRIG_PIN 16
+#define ECHO_PIN 17
+#define SD_CS_PIN 5
+#define LORA_SS 18
+#define LORA_RST 14
+#define LORA_DIO0 26
+#define SLIDER_PIN 34
+#define SLEEP_TIME 30
+#define MAX_PACKET_SIZE 128
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MPU6050 mpu;
+
+RTC_DATA_ATTR float baselineDistance = 0;
+RTC_DATA_ATTR bool isBaselineSet = false;
+
+struct TelemetryPacket {
+  uint16_t sync;
+  uint8_t packetID;
+  uint32_t timestamp;
+  float distance;
+  float subsidence;
+  int16_t ax;
+  int16_t ay;
+  int16_t az;
+  uint16_t slider;
+  uint8_t checksum;
+};
+
+TelemetryPacket packet;
+
+uint8_t rawBuffer[64];
+uint8_t compressedBuffer[MAX_PACKET_SIZE];
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  lcd.init();
+  lcd.backlight();
+  
+  SD.begin(SD_CS_PIN);
+  Wire.begin();
+  mpu.initialize();
+  
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  LoRa.begin(433E6);
+  
+  takeMeasurement();
+  enterDeepSleep();
+}
+
+void loop() {}
+
+void takeMeasurement() {
+  long duration;
+  float distanceCm;
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH);
+  distanceCm = (duration * 0.0343) / 2;
+
+  if (!isBaselineSet) {
+    baselineDistance = distanceCm;
+    isBaselineSet = true;
+  }
+
+  float subsidence = distanceCm - baselineDistance;
+
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  uint16_t slider = analogRead(SLIDER_PIN);
+
+  buildPacket(distanceCm, subsidence, ax, ay, az, slider);
+  sendCompressedPacket();
+  logToSD(distanceCm, subsidence, ax, ay, az, slider);
+}
+
+void buildPacket(float distance, float subsidence,
+                 int16_t ax, int16_t ay, int16_t az,
+                 uint16_t slider) {
+
+  packet.sync = 0xABCD;
+  packet.packetID = 0x01;
+  packet.timestamp = millis() / 1000; 
+  packet.distance = distance;
+  packet.subsidence = subsidence;
+  packet.ax = ax;
+  packet.ay = ay;
+  packet.az = az;
+  packet.slider = slider;
+
+  uint8_t *ptr = (uint8_t*)&packet;
+  uint8_t sum = 0;
+  for (int i = 0; i < sizeof(TelemetryPacket) - 1; i++) {
+    sum ^= ptr[i];
+  }
+  packet.checksum = sum;
+}
+
+void sendCompressedPacket() {
+
+  memcpy(rawBuffer, &packet, sizeof(packet));
+
+  int compressedSize = LZ4_compress_default(
+    (const char*)rawBuffer,
+    (char*)compressedBuffer + 5,
+    sizeof(packet),
+    MAX_PACKET_SIZE - 6
+  );
+
+  if (compressedSize <= 0) return;
+
+  compressedBuffer[0] = 0xAB;
+  compressedBuffer[1] = 0xCD;
+  compressedBuffer[2] = 0x02;
+  compressedBuffer[3] = compressedSize & 0xFF;
+  compressedBuffer[4] = (compressedSize >> 8) & 0xFF;
+
+  int totalSize = compressedSize + 5;
+
+  uint8_t checksum = 0;
+  for (int i = 0; i < totalSize; i++) {
+    checksum ^= compressedBuffer[i];
+  }
+
+  compressedBuffer[totalSize] = checksum;
+  totalSize++;
+
+  LoRa.beginPacket();
+  LoRa.write(compressedBuffer, totalSize);
+  LoRa.endPacket();
+}
+
+void logToSD(float distance, float subsidence,
+             int16_t ax, int16_t ay, int16_t az,
+             uint16_t slider) {
+
+  File file = SD.open("/data.csv", FILE_APPEND);
+  if (file) {
+    file.print(millis()/1000.0);
+    file.print(",");
+    file.print(distance);
+    file.print(",");
+    file.print(subsidence);
+    file.print(",");
+    file.print(ax);
+    file.print(",");
+    file.print(ay);
+    file.print(",");
+    file.print(az);
+    file.print(",");
+    file.println(slider);
+    file.close();
+  }
+}
+
+void enterDeepSleep() {
+  esp_sleep_enable_timer_wakeup(SLEEP_TIME * 1000000ULL);
+  esp_deep_sleep_start();
+}
