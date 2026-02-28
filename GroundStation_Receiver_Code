@@ -1,0 +1,111 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <LZ4.h>
+
+#define LORA_SS 18
+#define LORA_RST 14
+#define LORA_DIO0 26
+#define MAX_PACKET_SIZE 128
+
+struct TelemetryPacket {
+  uint16_t sync;
+  uint8_t packetID;
+  uint32_t timestamp;
+  float distance;
+  float subsidence;
+  int16_t ax;
+  int16_t ay;
+  int16_t az;
+  uint16_t slider;
+  uint8_t checksum;
+};
+
+TelemetryPacket receivedPacket;
+uint8_t receiveBuffer[MAX_PACKET_SIZE];
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("Initializing LoRa Receiver...");
+  
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(433E6)) {
+    Serial.println("Starting LoRa failed!");
+    while (1);
+  }
+  Serial.println("LoRa Receiver Ready. Waiting for packets...");
+}
+
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    processIncomingPacket(packetSize);
+  }
+}
+
+void processIncomingPacket(int packetSize) {
+  if (packetSize > MAX_PACKET_SIZE || packetSize < 6) {
+    Serial.println("Packet size invalid.");
+    return;
+  }
+
+  int index = 0;
+  while (LoRa.available()) {
+    receiveBuffer[index++] = (uint8_t)LoRa.read();
+  }
+
+  uint8_t calculatedOuterSum = 0;
+  for (int i = 0; i < packetSize - 1; i++) {
+    calculatedOuterSum ^= receiveBuffer[i];
+  }
+  if (calculatedOuterSum != receiveBuffer[packetSize - 1]) {
+    Serial.println("Error: Outer wrapper checksum failed!");
+    return;
+  }
+
+  if (receiveBuffer[0] != 0xAB || receiveBuffer[1] != 0xCD || receiveBuffer[2] != 0x02) {
+    Serial.println("Error: Invalid sync bytes or packet type!");
+    return;
+  }
+
+  int compressedSize = receiveBuffer[3] | (receiveBuffer[4] << 8);
+
+  int decompressedSize = LZ4_decompress_safe(
+    (const char*)receiveBuffer + 5,
+    (char*)&receivedPacket,
+    compressedSize,
+    sizeof(TelemetryPacket)
+  );
+
+  if (decompressedSize != sizeof(TelemetryPacket)) {
+    Serial.println("Error: LZ4 decompression failed or size mismatch!");
+    return;
+  }
+
+  uint8_t *ptr = (uint8_t*)&receivedPacket;
+  uint8_t calculatedInnerSum = 0;
+  for (int i = 0; i < sizeof(TelemetryPacket) - 1; i++) {
+    calculatedInnerSum ^= ptr[i];
+  }
+
+  if (calculatedInnerSum != receivedPacket.checksum) {
+    Serial.println("Error: Inner telemetry checksum failed!");
+    return;
+  }
+
+  printTelemetry();
+}
+
+void printTelemetry() {
+  Serial.println("--- Valid Packet Received ---");
+  Serial.print("Timestamp: "); Serial.println(receivedPacket.timestamp);
+  Serial.print("Distance:  "); Serial.print(receivedPacket.distance); Serial.println(" cm");
+  Serial.print("Subsidence:"); Serial.print(receivedPacket.subsidence); Serial.println(" cm");
+  Serial.print("Accel (X,Y,Z): "); 
+  Serial.print(receivedPacket.ax); Serial.print(", ");
+  Serial.print(receivedPacket.ay); Serial.print(", ");
+  Serial.println(receivedPacket.az);
+  Serial.print("Slider:    "); Serial.println(receivedPacket.slider);
+  Serial.println("-----------------------------");
+}
